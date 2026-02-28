@@ -2,14 +2,12 @@
 nuplan_dataset/
 *.db
 
-# 模型输出 & 可视化结果
-vis_output/
+# 模型输出（权重文件）
 Diffusion-Planner/checkpoints/
 Diffusion-Planner/cache/
 Diffusion-Planner/data/
 Diffusion-Planner/R/
 Diffusion-Planner/REPLACE_WITH_TRAIN_SET_PATH/
-*.png
 *.npz
 *.pth
 
