@@ -1,0 +1,15 @@
+_target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
+scenario_types: null
+scenario_tokens: null
+log_names: null
+map_names: null
+num_scenarios_per_type: null
+limit_total_scenarios: 40  # 先只跑2个场景，跑通了再改大
+timestamp_threshold_s: null
+ego_displacement_minimum_m: null
+ego_start_speed_threshold: null
+ego_stop_speed_threshold: null
+speed_noise_tolerance: null
+expand_scenarios: false
+remove_invalid_goals: true
+shuffle: false
