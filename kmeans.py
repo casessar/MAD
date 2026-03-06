@@ -498,3 +498,578 @@ def visualize_scenarios(n_scenarios=20):
 
 if __name__ == '__main__':
     visualize_scenarios(n_scenarios=20)
+
+"""
+基于 nuPlan expert trajectory 的 K-Means Anchor 聚类（全场景版）
+
+策略：
+  - 静止场景（初始速度 < SPEED_STATIC）跳过，不参与聚类
+  - 所有运动场景合并，做 K=15 的 K-Means
+  - 额外手动追加 1 个全零静止 anchor（原点不动）
+  - 最终 anchors.npz 包含：
+      'moving'  shape=(15, T*2)   运动 anchor
+      'static'  shape=(1,  T*2)   静止 anchor（全零）
+"""
+
+import os
+import glob
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from typing import Optional
+
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
+from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
+from nuplan.planning.utils.multithreading.worker_sequential import Sequential
+
+# ─────────────────────────────────────────────
+# 路径 & 超参数配置
+# ─────────────────────────────────────────────
+DATA_ROOT    = '/home/xzl/nuplan_dataset/nuplan-v1.1_mini/data/cache'
+MAP_ROOT     = '/home/xzl/nuplan_dataset/nuplan-maps-v1.0/maps'
+SENSOR_ROOT  = '/home/xzl/nuplan_dataset/nuplan-v1.1_mini_camera_0/nuplan-v1.1_mini_camera_0'
+DB_FILES     = sorted(glob.glob(DATA_ROOT + '/mini/*.db'))
+MAP_VERSION  = 'nuplan-maps-v1.0'
+OUT_DIR      = '/home/xzl/diffusion_planner_test/vis_output'
+os.makedirs(OUT_DIR, exist_ok=True)
+
+FUTURE_HORIZON  = 5.0    # 预测时长（秒）
+SAMPLE_INTERVAL = 0.5    # 采样间隔（秒） → T=10 个点
+NUM_CLUSTERS    = 15     # 运动 anchor 数量（静止另算）
+SPEED_STATIC    = 0.5    # 低于此速度（m/s）视为静止，不参与聚类
+N_TARGET        = 30000  # 目标收集样本数（够多即可，提前结束）
+LOAD            = 50000  # 最多从 nuPlan 加载场景数
+
+AXIS_XLIM = (-30, 30)
+AXIS_YLIM = (-5,  85)
+
+
+# ─────────────────────────────────────────────
+# 单场景轨迹提取
+# ─────────────────────────────────────────────
+def extract_one(scenario) -> Optional[np.ndarray]:
+    """
+    返回归一化到自车坐标系的未来轨迹，shape=(T*2,)
+    格式：[lx0, ly0, lx1, ly1, ...]  lx=前方, ly=左方
+    初始速度 < SPEED_STATIC 时返回 None。
+    """
+    try:
+        init  = scenario.initial_ego_state
+        speed = init.dynamic_car_state.speed
+        if speed < SPEED_STATIC:
+            return None
+
+        ox, oy, oh = init.rear_axle.x, init.rear_axle.y, init.rear_axle.heading
+        T = int(FUTURE_HORIZON / SAMPLE_INTERVAL)
+
+        future = list(scenario.get_ego_future_trajectory(
+            iteration=0, time_horizon=FUTURE_HORIZON, num_samples=T,
+        ))
+        if len(future) < T:
+            return None
+
+        cos_h, sin_h = np.cos(-oh), np.sin(-oh)
+        local = []
+        for st in future[:T]:
+            dx = st.waypoint.x - ox
+            dy = st.waypoint.y - oy
+            local.extend([
+                cos_h * dx - sin_h * dy,   # lx：前方（纵向）
+                sin_h * dx + cos_h * dy,   # ly：左方（横向）
+            ])
+        return np.array(local, dtype=np.float32)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
+# 可视化：单张图展示全部 15 条运动 anchor
+# ─────────────────────────────────────────────
+def visualize_anchors(moving_centers: np.ndarray, T: int,
+                      n_samples: int, save_path: str):
+    """
+    将 K=15 条运动 anchor 画在同一张图中，用 tab20 区分颜色。
+    静止 anchor（原点）用特殊标记标出。
+    """
+    K          = len(moving_centers)
+    time_steps = np.arange(1, T + 1) * SAMPLE_INTERVAL  # [0.5, 1.0, ..., 5.0]
+
+    plt.rcParams.update({
+        'font.family':       'DejaVu Sans',
+        'font.size':         11,
+        'axes.titlesize':    13,
+        'axes.labelsize':    11,
+        'xtick.labelsize':   10,
+        'ytick.labelsize':   10,
+        'axes.linewidth':    0.8,
+        'xtick.major.width': 0.6,
+        'ytick.major.width': 0.6,
+    })
+
+    fig, ax = plt.subplots(figsize=(7, 9))
+    fig.patch.set_facecolor('white')
+
+    # 背景
+    ax.set_facecolor('#f7f9fc')
+    ax.grid(True, color='#dce3ec', linewidth=0.5, linestyle='--', zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#b0bec5')
+        spine.set_linewidth(0.8)
+
+    # 零线
+    ax.axhline(0, color='#90a4ae', lw=0.8, zorder=1)
+    ax.axvline(0, color='#90a4ae', lw=0.8, zorder=1)
+
+    # 用 tab20 给 15 条 anchor 分配颜色
+    cmap_tab = matplotlib.colormaps.get_cmap('tab20')
+    colors   = [cmap_tab(i / K) for i in range(K)]
+
+    for k_idx, (row, color) in enumerate(zip(moving_centers, colors)):
+        lx = row[0::2]   # 前方 → 纵轴
+        ly = row[1::2]   # 左方 → 横轴
+
+        # 从原点到第一个点的虚线
+        ax.plot([0, ly[0]], [0, lx[0]],
+                '--', color=color, lw=0.9, alpha=0.5, zorder=2)
+        # 轨迹主线
+        ax.plot(ly, lx, '-', color=color, lw=2.2, alpha=0.9, zorder=3,
+                solid_capstyle='round', solid_joinstyle='round',
+                label=f'Anchor {k_idx + 1:02d}')
+        # 时间步散点（plasma 渐变表示时间进展）
+        ax.scatter(ly, lx, c=time_steps, cmap='plasma',
+                   vmin=0, vmax=FUTURE_HORIZON,
+                   s=32, zorder=4, edgecolors='white', linewidths=0.4)
+        # 终点
+        ax.plot(ly[-1], lx[-1], 'o', color=color, markersize=7, zorder=5,
+                markeredgecolor='white', markeredgewidth=0.9)
+
+    # 静止 anchor 标记（原点处打叉）
+    ax.plot(0, 0, 'x', color='#7f8c8d', markersize=10, markeredgewidth=2.2,
+            zorder=9, label='Static anchor (origin)')
+
+    # 自车三角形
+    ax.plot(0, 0, marker=(3, 0, -90),
+            color='#1a237e', markersize=18,
+            markeredgecolor='white', markeredgewidth=1.5,
+            zorder=10, label='Ego vehicle')
+
+    # 标题与轴标签
+    ax.set_title(
+        f'K-Means Trajectory Anchors (All Scenarios)\n'
+        f'K={K} moving  +  1 static  |  N={n_samples:,} samples',
+        fontsize=13, fontweight='bold', color='#1a237e', pad=12,
+    )
+    ax.set_xlabel('Lateral displacement (m)', labelpad=7, color='#37474f')
+    ax.set_ylabel('Longitudinal displacement (m)', labelpad=7, color='#37474f')
+    ax.tick_params(colors='#546e7a', direction='in', length=3)
+
+    # 统计信息框
+    ax.text(0.98, 0.02,
+            f'Horizon: {FUTURE_HORIZON:.0f}s @ {SAMPLE_INTERVAL}s\n'
+            f'Total anchors: {K + 1}  (moving={K}, static=1)',
+            transform=ax.transAxes, fontsize=8.5,
+            ha='right', va='bottom', color='#546e7a',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                      edgecolor='#b0bec5', alpha=0.9))
+
+    ax.set_xlim(AXIS_XLIM)
+    ax.set_ylim(AXIS_YLIM)
+
+    # 图例（放右上，最多两列避免遮挡）
+    ax.legend(loc='upper right', fontsize=7.5, framealpha=0.88,
+              edgecolor='#b0bec5', facecolor='white',
+              ncol=2, handlelength=1.4, labelspacing=0.4)
+
+    # 时间色条
+    sm = plt.cm.ScalarMappable(
+        cmap='plasma', norm=plt.Normalize(vmin=0, vmax=FUTURE_HORIZON))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.03, aspect=28)
+    cbar.set_label('Time (s)', fontsize=10, color='#37474f', labelpad=8)
+    cbar.ax.tick_params(labelsize=9, colors='#546e7a')
+    cbar.outline.set_edgecolor('#b0bec5')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+    print(f"  可视化已保存 (300 dpi): {save_path}")
+
+
+# ─────────────────────────────────────────────
+# 主流程
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    import time
+    t0 = time.time()
+
+    T = int(FUTURE_HORIZON / SAMPLE_INTERVAL)
+
+    # ── 1. 加载场景 ──────────────────────────────────────────────
+    print(f"加载 {len(DB_FILES)} 个 db，最多采样 {LOAD} 个场景（shuffle）...")
+    builder = NuPlanScenarioBuilder(
+        data_root=DATA_ROOT, map_root=MAP_ROOT, sensor_root=SENSOR_ROOT,
+        db_files=DB_FILES, map_version=MAP_VERSION, include_cameras=False,
+    )
+    sf = ScenarioFilter(
+        scenario_types=None, scenario_tokens=None,
+        log_names=None, map_names=None,
+        num_scenarios_per_type=None,
+        limit_total_scenarios=LOAD,
+        expand_scenarios=False,
+        remove_invalid_goals=False,
+        shuffle=True,
+        timestamp_threshold_s=None,
+        ego_displacement_minimum_m=None,
+        ego_start_speed_threshold=None,
+        ego_stop_speed_threshold=None,
+        speed_noise_tolerance=None,
+    )
+    scenarios = builder.get_scenarios(sf, Sequential())
+    print(f"实际加载: {len(scenarios)} 个场景  ({time.time()-t0:.1f}s)\n")
+
+    # ── 2. 遍历场景，收集运动轨迹 ────────────────────────────────
+    trajs   = []   # 所有运动场景的归一化轨迹
+    n_static = 0   # 跳过的静止场景计数
+    n_error  = 0   # 提取失败计数
+
+    print(f"提取轨迹（目标 {N_TARGET} 条，速度 >= {SPEED_STATIC} m/s）...")
+    for idx, sc in enumerate(scenarios):
+        if len(trajs) >= N_TARGET:
+            print(f"  已收集 {N_TARGET} 条，提前结束（处理了 {idx} 个场景）")
+            break
+
+        result = extract_one(sc)
+        if result is None:
+            # 区分静止与异常
+            try:
+                speed = sc.initial_ego_state.dynamic_car_state.speed
+                if speed < SPEED_STATIC:
+                    n_static += 1
+                else:
+                    n_error += 1
+            except Exception:
+                n_error += 1
+            continue
+
+        trajs.append(result)
+
+        if idx % 500 == 0:
+            print(f"  [{idx:>5d}/{len(scenarios)}]  已收集={len(trajs):,}"
+                  f"  跳过静止={n_static}  异常={n_error}")
+
+    print(f"\n===== 数据收集结果 =====")
+    print(f"  运动轨迹: {len(trajs):,} 条")
+    print(f"  跳过静止: {n_static}")
+    print(f"  提取异常: {n_error}")
+
+    if len(trajs) < NUM_CLUSTERS:
+        raise RuntimeError(f"样本数 ({len(trajs)}) 不足 K={NUM_CLUSTERS}，请增大 LOAD。")
+
+    # ── 3. K-Means 聚类（K=15，仅运动场景）────────────────────────
+    data = np.array(trajs, dtype=np.float32)   # (N, T*2)
+    print(f"\nK-Means  K={NUM_CLUSTERS}，样本={len(data)} ...")
+    km = KMeans(n_clusters=NUM_CLUSTERS, random_state=42,
+                n_init='auto', max_iter=500)
+    km.fit(data)
+    moving_centers = km.cluster_centers_   # (15, T*2)
+    counts = np.bincount(km.labels_)
+    print(f"  完成：簇大小 min={counts.min()}  max={counts.max()}"
+          f"  mean={counts.mean():.1f}  inertia={km.inertia_:.2f}")
+
+    # ── 4. 静止 anchor（全零，表示原地不动）─────────────────────
+    static_anchor = np.zeros((1, T * 2), dtype=np.float32)   # (1, T*2)
+
+    # ── 5. 保存 npz ──────────────────────────────────────────────
+    npz_path = os.path.join(OUT_DIR, 'anchors.npz')
+    np.savez(npz_path, moving=moving_centers, static=static_anchor)
+    print(f"\nAnchor 已保存: {npz_path}")
+    print(f"  moving : shape={moving_centers.shape}  (K=15, T={T}, 每点2维)")
+    print(f"  static : shape={static_anchor.shape}   (全零，原地不动)")
+    print(f"  合计    : {NUM_CLUSTERS + 1} 个 anchor")
+
+    # ── 6. 可视化 ────────────────────────────────────────────────
+    vis_path = os.path.join(OUT_DIR, 'kmeans_anchors.png')
+    visualize_anchors(moving_centers, T, len(trajs), vis_path)
+
+    print(f"\n总耗时: {time.time()-t0:.1f}s")
+"""
+基于 nuPlan expert trajectory 的 K-Means Anchor 聚类
+策略：
+  - 过滤静止场景（speed < 0.5 m/s），其余所有运动场景统一聚类
+  - K = 15（运动 anchor）+ 1 个手动追加的全零静止 anchor = 共 16 个
+  - 保存字段：anchors['moving'] (15, T*2)，anchors['static'] (1, T*2)
+"""
+import os
+import glob
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
+from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
+from nuplan.planning.utils.multithreading.worker_sequential import Sequential
+
+# ─────────────────────────────────────────────
+# 路径 & 超参数配置
+# ─────────────────────────────────────────────
+DATA_ROOT   = '/home/xzl/nuplan_dataset/nuplan-v1.1_mini/data/cache'
+MAP_ROOT    = '/home/xzl/nuplan_dataset/nuplan-maps-v1.0/maps'
+SENSOR_ROOT = '/home/xzl/nuplan_dataset/nuplan-v1.1_mini_camera_0/nuplan-v1.1_mini_camera_0'
+DB_FILES    = sorted(glob.glob(DATA_ROOT + '/mini/*.db'))
+MAP_VERSION = 'nuplan-maps-v1.0'
+OUT_DIR     = '/home/xzl/diffusion_planner_test/vis_output'
+os.makedirs(OUT_DIR, exist_ok=True)
+
+FUTURE_HORIZON  = 5.0   # 预测时长（秒）
+SAMPLE_INTERVAL = 0.5   # 采样间隔（秒）→ T = 10 个点
+T               = int(FUTURE_HORIZON / SAMPLE_INTERVAL)
+
+K_MOVING        = 15    # 运动场景聚类数
+SPEED_STATIC    = 0.5   # 低于此速度视为静止，过滤掉（m/s）
+LOAD            = 50000 # 最多加载场景数
+N_TARGET        = 20000 # 目标收集运动轨迹数
+
+# 可视化坐标轴范围
+AXIS_XLIM = (-28, 28)
+AXIS_YLIM = (-5,  80)
+
+
+# ─────────────────────────────────────────────
+# 单场景轨迹提取
+# ─────────────────────────────────────────────
+def extract_one(scenario):
+    """
+    提取单个场景的相对坐标轨迹。
+    返回 np.ndarray (T*2,) 或 None（静止 / 数据不足 / 异常）。
+    坐标系：以初始位置为原点，初始朝向为前方。
+    layout: [lx_0, ly_0, lx_1, ly_1, ..., lx_{T-1}, ly_{T-1}]
+      lx: 纵向（前方）位移
+      ly: 横向（左方）位移
+    """
+    try:
+        init  = scenario.initial_ego_state
+        speed = init.dynamic_car_state.speed
+        # 过滤静止场景
+        if speed < SPEED_STATIC:
+            return None
+
+        ox, oy, oh = init.rear_axle.x, init.rear_axle.y, init.rear_axle.heading
+        future = list(scenario.get_ego_future_trajectory(
+            iteration=0, time_horizon=FUTURE_HORIZON, num_samples=T,
+        ))
+        if len(future) < T:
+            return None
+
+        cos_h, sin_h = np.cos(-oh)
+        traj = []
+        for st in future[:T]:
+            dx = st.waypoint.x - ox
+            dy = st.waypoint.y - oy
+            lx =  cos_h * dx - sin_h * dy   # 纵向（前方）
+            ly =  sin_h * dx + cos_h * dy   # 横向（左方）
+            traj.extend([lx, ly])
+        return np.array(traj, dtype=np.float32)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
+# 可视化：所有 moving anchor 画在一张图上
+# ─────────────────────────────────────────────
+def visualize_anchors(moving_centers: np.ndarray, n_samples: int, save_path: str):
+    K          = len(moving_centers)
+    time_steps = np.arange(1, T + 1) * SAMPLE_INTERVAL  # [0.5, 1.0, ..., 5.0]
+
+    plt.rcParams.update({
+        'font.family':       'DejaVu Sans',
+        'font.size':         11,
+        'axes.titlesize':    13,
+        'axes.labelsize':    11,
+        'xtick.labelsize':   10,
+        'ytick.labelsize':   10,
+        'axes.linewidth':    0.8,
+    })
+
+    fig, ax = plt.subplots(figsize=(7, 8))
+    fig.patch.set_facecolor('white')
+
+    ax.set_facecolor('#f7f9fc')
+    ax.grid(True, color='#dce3ec', linewidth=0.5, linestyle='--', zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#b0bec5')
+        spine.set_linewidth(0.8)
+
+    ax.axhline(0, color='#90a4ae', lw=0.8, zorder=1)
+    ax.axvline(0, color='#90a4ae', lw=0.8, zorder=1)
+
+    cmap = matplotlib.colormaps.get_cmap('tab20')
+
+    for k_idx, row in enumerate(moving_centers):
+        lx = row[0::2]   # 纵向 → 纵轴 Y
+        ly = row[1::2]   # 横向 → 横轴 X
+        color = cmap(k_idx / max(K - 1, 1))
+
+        # 原点到第一个点的虚线
+        ax.plot([0, ly[0]], [0, lx[0]],
+                '--', color=color, lw=0.8, alpha=0.5, zorder=2)
+        # 主轨迹线
+        ax.plot(ly, lx, '-', color=color, lw=2.0, alpha=0.9, zorder=3,
+                solid_capstyle='round', solid_joinstyle='round',
+                label=f'Anchor {k_idx + 1:02d}')
+        # 时间步散点（plasma 渐变表示时间）
+        ax.scatter(ly, lx, c=time_steps, cmap='plasma',
+                   vmin=0, vmax=FUTURE_HORIZON,
+                   s=28, zorder=4, edgecolors='white', linewidths=0.4)
+        # 终点标记
+        ax.plot(ly[-1], lx[-1], 'o', color=color, markersize=6, zorder=5,
+                markeredgecolor='white', markeredgewidth=0.8)
+
+    # 静止 anchor 标记（原点圆圈）
+    ax.plot(0, 0, 's', color='gray', markersize=9, zorder=9,
+            markeredgecolor='white', markeredgewidth=1.2,
+            label='Static anchor (zero)')
+
+    # 自车标记
+    ax.plot(0, 0, marker=(3, 0, -90),
+            color='#1a6faf', markersize=16,
+            markeredgecolor='white', markeredgewidth=1.5,
+            zorder=10, label='Ego vehicle')
+
+    ax.set_title(
+        f'K-Means Trajectory Anchors (All Scenarios)\n'
+        f'K = {K} moving  +  1 static  =  {K + 1} total',
+        fontsize=13, fontweight='bold', color='#1a237e', pad=12,
+    )
+    ax.set_xlabel('Lateral displacement (m)', labelpad=7, color='#37474f')
+    ax.set_ylabel('Longitudinal displacement (m)', labelpad=7, color='#37474f')
+    ax.tick_params(colors='#546e7a', direction='in', length=3)
+
+    ax.text(0.98, 0.02,
+            f'N = {n_samples:,}  |  K_moving = {K}\n'
+            f'Horizon: {FUTURE_HORIZON:.0f}s @ {SAMPLE_INTERVAL}s\n'
+            f'Static threshold: v < {SPEED_STATIC} m/s',
+            transform=ax.transAxes, fontsize=8.5,
+            ha='right', va='bottom', color='#546e7a',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                      edgecolor='#b0bec5', alpha=0.9))
+
+    ax.set_xlim(AXIS_XLIM)
+    ax.set_ylim(AXIS_YLIM)
+    ax.legend(loc='upper left', fontsize=7.5, framealpha=0.88,
+              edgecolor='#b0bec5', facecolor='white', ncol=2)
+
+    # 时间色条
+    sm = plt.cm.ScalarMappable(
+        cmap='plasma', norm=plt.Normalize(vmin=0, vmax=FUTURE_HORIZON))
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.03, aspect=28)
+    cbar.set_label('Time (s)', fontsize=10, color='#37474f', labelpad=8)
+    cbar.ax.tick_params(labelsize=9, colors='#546e7a')
+    cbar.outline.set_edgecolor('#b0bec5')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight',
+                facecolor='white', edgecolor='none')
+    plt.close(fig)
+    print(f"  可视化已保存 (300 dpi): {save_path}")
+
+
+# ─────────────────────────────────────────────
+# 主流程
+# ─────────────────────────────────────────────
+if __name__ == '__main__':
+    import time
+    t0 = time.time()
+
+    # ── 1. 加载场景 ───────────────────────────────────────────────
+    print(f"加载 {len(DB_FILES)} 个 db，最多采样 {LOAD} 个场景（shuffle）...")
+    builder = NuPlanScenarioBuilder(
+        data_root=DATA_ROOT, map_root=MAP_ROOT, sensor_root=SENSOR_ROOT,
+        db_files=DB_FILES, map_version=MAP_VERSION, include_cameras=False,
+    )
+    sf = ScenarioFilter(
+        scenario_types=None, scenario_tokens=None,
+        log_names=None, map_names=None,
+        num_scenarios_per_type=None,
+        limit_total_scenarios=LOAD,
+        expand_scenarios=False,
+        remove_invalid_goals=False,
+        shuffle=True,
+        timestamp_threshold_s=None,
+        ego_displacement_minimum_m=None,
+        ego_start_speed_threshold=None,
+        ego_stop_speed_threshold=None,
+        speed_noise_tolerance=None,
+    )
+    scenarios = builder.get_scenarios(sf, Sequential())
+    print(f"实际加载: {len(scenarios)} 个场景  ({time.time()-t0:.1f}s)\n")
+
+    # ── 2. 提取所有运动场景轨迹 ───────────────────────────────────
+    moving_trajs = []
+    n_static_skipped = 0
+    n_error_skipped  = 0
+
+    print(f"提取轨迹（目标 {N_TARGET} 条运动轨迹）...")
+    for idx, sc in enumerate(scenarios):
+        if len(moving_trajs) >= N_TARGET:
+            print(f"  已收集 {N_TARGET} 条，提前结束（处理了 {idx} 个场景）")
+            break
+
+        result = extract_one(sc)
+        if result is None:
+            # 粗略区分：速度过低 vs 其他异常（这里统一计入 static/error）
+            n_static_skipped += 1
+            continue
+
+        moving_trajs.append(result)
+
+        if idx % 500 == 0:
+            print(f"  [{idx:>5d}/{len(scenarios)}]  运动轨迹: {len(moving_trajs):>6d}")
+
+    print(f"\n===== 数据收集结果 =====")
+    print(f"  运动场景轨迹:  {len(moving_trajs):>6d} 条")
+    print(f"  跳过（静止/异常）: {n_static_skipped:>6d} 条")
+    print(f"  耗时: {time.time()-t0:.1f}s")
+
+    # ── 3. K-Means 聚类（K=15） ───────────────────────────────────
+    data = np.array(moving_trajs, dtype=np.float32)   # (N, T*2)
+    k = min(K_MOVING, len(data))
+    if k < K_MOVING:
+        print(f"  ⚠ 样本不足，K: {K_MOVING} → {k}")
+
+    print(f"\nK-Means 聚类  K={k}，样本={len(data)} ...")
+    km = KMeans(n_clusters=k, random_state=42, n_init='auto', max_iter=300)
+    km.fit(data)
+    moving_centers = km.cluster_centers_   # (15, T*2)
+    counts = np.bincount(km.labels_)
+    print(f"  完成  簇大小: min={counts.min()}  max={counts.max()}  mean={counts.mean():.1f}")
+    print(f"  耗时: {time.time()-t0:.1f}s")
+
+    # ── 4. 追加全零静止 anchor ────────────────────────────────────
+    static_center = np.zeros((1, T * 2), dtype=np.float32)   # (1, T*2)
+    all_centers   = np.concatenate([moving_centers, static_center], axis=0)  # (16, T*2)
+
+    print(f"\n===== Anchor 汇总 =====")
+    print(f"  moving anchors : shape={moving_centers.shape}   (K=15, T={T}, 每点2维)")
+    print(f"  static anchor  : shape={static_center.shape}  (全零)")
+    print(f"  总计           : {len(all_centers)} 个 anchor")
+
+    # ── 5. 保存 npz ──────────────────────────────────────────────
+    npz_path = os.path.join(OUT_DIR, 'anchors.npz')
+    np.savez(npz_path, moving=moving_centers, static=static_center)
+    print(f"\nAnchor 已保存: {npz_path}")
+    print(f"  载入方式: data = np.load('{npz_path}')")
+    print(f"            data['moving'].shape  → {moving_centers.shape}")
+    print(f"            data['static'].shape  → {static_center.shape}")
+
+    # ── 6. 可视化 ────────────────────────────────────────────────
+    vis_path = os.path.join(OUT_DIR, 'kmeans_anchors.png')
+    visualize_anchors(moving_centers, n_samples=len(moving_trajs), save_path=vis_path)
+
+    print(f"\n总耗时: {time.time()-t0:.1f}s")
